@@ -1,0 +1,162 @@
+{
+  "profile": "message-samples-1",
+  "run_id": "sample-c7b435188da6f9df",
+  "station_id": "P01",
+  "status": "sample exchange completed",
+  "last_completed_step": 10,
+  "inbound": [
+    {
+      "step": 2,
+      "message_type": "ready",
+      "request_id": null,
+      "retry": false
+    },
+    {
+      "step": 2,
+      "message_type": "advertise",
+      "request_id": "student-advertise-1",
+      "retry": false
+    },
+    {
+      "step": 3,
+      "message_type": "advertise",
+      "request_id": "student-advertise-seeking-1",
+      "retry": false
+    },
+    {
+      "step": 4,
+      "message_type": "offer",
+      "request_id": "student-offer-1",
+      "retry": false
+    },
+    {
+      "step": 7,
+      "message_type": "accept",
+      "request_id": "student-accept-1",
+      "retry": false
+    },
+    {
+      "step": 8,
+      "message_type": "withdraw",
+      "request_id": "student-withdraw-1",
+      "retry": false
+    },
+    {
+      "step": 9,
+      "message_type": "advertise",
+      "request_id": "student-advertise-2",
+      "retry": false
+    },
+    {
+      "step": 10,
+      "message_type": "sync",
+      "request_id": null,
+      "retry": false
+    }
+  ],
+  "outbound_written": [
+    {
+      "message_type": "state",
+      "request_id": null,
+      "world_version": 2,
+      "snapshot_sequence": 1
+    },
+    {
+      "message_type": "readiness",
+      "request_id": null,
+      "world_version": null,
+      "snapshot_sequence": null
+    },
+    {
+      "message_type": "result",
+      "request_id": "student-advertise-1",
+      "world_version": 3,
+      "snapshot_sequence": null
+    },
+    {
+      "message_type": "state",
+      "request_id": null,
+      "world_version": 3,
+      "snapshot_sequence": 2
+    },
+    {
+      "message_type": "result",
+      "request_id": "student-advertise-seeking-1",
+      "world_version": 4,
+      "snapshot_sequence": null
+    },
+    {
+      "message_type": "state",
+      "request_id": null,
+      "world_version": 4,
+      "snapshot_sequence": 3
+    },
+    {
+      "message_type": "result",
+      "request_id": "student-offer-1",
+      "world_version": 5,
+      "snapshot_sequence": null
+    },
+    {
+      "message_type": "state",
+      "request_id": null,
+      "world_version": 5,
+      "snapshot_sequence": 4
+    },
+    {
+      "message_type": "state",
+      "request_id": null,
+      "world_version": 6,
+      "snapshot_sequence": 5
+    },
+    {
+      "message_type": "state",
+      "request_id": null,
+      "world_version": 7,
+      "snapshot_sequence": 6
+    },
+    {
+      "message_type": "result",
+      "request_id": "student-accept-1",
+      "world_version": 8,
+      "snapshot_sequence": null
+    },
+    {
+      "message_type": "state",
+      "request_id": null,
+      "world_version": 8,
+      "snapshot_sequence": 7
+    },
+    {
+      "message_type": "result",
+      "request_id": "student-withdraw-1",
+      "world_version": 9,
+      "snapshot_sequence": null
+    },
+    {
+      "message_type": "state",
+      "request_id": null,
+      "world_version": 9,
+      "snapshot_sequence": 8
+    },
+    {
+      "message_type": "protocol_error",
+      "request_id": "student-advertise-2",
+      "world_version": null,
+      "snapshot_sequence": null
+    },
+    {
+      "message_type": "state",
+      "request_id": null,
+      "world_version": 9,
+      "snapshot_sequence": 9
+    }
+  ],
+  "mismatch": null,
+  "final_inventory": {
+    "water": 28,
+    "food": 31,
+    "components": 31
+  },
+  "interpretation": "Records successful server writes and validated inbound samples. It does not prove client decoding, display, or full C01–C20/S01–S24 conformance."
+}
