@@ -1,6 +1,11 @@
 import asyncio
 import os
+import sys
+import traceback
 import uuid
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
+from pathlib import Path
 
 import websockets
 
@@ -10,13 +15,14 @@ from collections import defaultdict
 
 
 SERVER_URL = "wss://spaceport.edneo.com/ws"
+#SERVER_URL = "ws://127.0.0.1:3001/ws"
 SUBPROTOCOL = "bazaar.protobuf.v2"
 STATION_ID = "P07"
 
 # Keep enough resources for approximately this many future ticks.
 SAFETY_TICKS = 3
-MIN_TRADE_AMOUNT = 1
-MAX_TRADE_AMOUNT = 3
+TARGET_TICKS = 8
+MAX_TRADE_AMOUNT = 6
 
 RESOURCE_NAMES = {
     bazaar.RESOURCE_WATER: "water",
@@ -73,32 +79,31 @@ def effective_upkeep(state):
     return demands
 
 
-def survival_score(inventory, demands):
-    """
-    Return the fewest estimated ticks remaining among resources.
-
-    A higher score is better.
-    """
-
-    scores = []
-
-    for resource in RESOURCES:
-        required = demands[resource]
-
-        if required > 0:
-            scores.append(
-                inventory[resource] / required
-            )
-
-    if not scores:
-        return float("inf")
-
-    return min(scores)
-
-
 # --------------------------------------------------
 # Printing functions
 # --------------------------------------------------
+
+class TeeOutput:
+    """Copy terminal output to a log file, flushing every write."""
+
+    def __init__(self, terminal, log_file):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    def write(self, text):
+        self.log_file.write(text)
+        self.log_file.flush()
+        self.terminal.write(text)
+        self.terminal.flush()
+        return len(text)
+
+    def flush(self):
+        self.log_file.flush()
+        self.terminal.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.terminal, name)
+
 
 def print_state(state):
     """Display important information from a state snapshot."""
@@ -219,7 +224,7 @@ def print_state(state):
 
 
 def print_result(result):
-    """Display the result of one of P07's commands."""
+    """Display the result of one of our commands."""
 
     print("\n--- COMMAND RESULT ---")
     print("Request ID:", result.request_id)
@@ -258,6 +263,11 @@ def print_protocol_error(error):
 class SurvivalBot:
     def __init__(self):
         self.sent_offer_keys = set()
+        self.accept_attempts = set()
+        self.peer_attempts = {}
+        self.sent_commands = {}
+        self.pending_request = None
+        self.pending_version = None
 
         # Evidence that each station specializes in each resource.
         self.market_evidence = defaultdict(
@@ -279,7 +289,7 @@ class SurvivalBot:
 
         random_part = uuid.uuid4().hex[:12]
 
-        return f"p07-{action}-{random_part}"
+        return f"{STATION_ID.lower()}-{action}-{random_part}"
 
     def add_evidence(
         self,
@@ -494,573 +504,210 @@ class SurvivalBot:
 
         print("-------------------------------\n")
 
-    def command_space_available(self, state):
-        """Check total stored-result capacity."""
+    def outgoing(self, state):
+        return [o for o in state.offers.items
+                if o.proposer_id == state.self_station_id
+                and o.status == bazaar.OFFER_STATUS_OPEN
+                and o.expires_tick > state.tick]
 
-        used = len(state.request_results.items)
-        maximum = (
-            state.rules.max_request_records_per_station
-        )
+    def available_inventory(self, state):
+        inventory = bundle_values(state.self.inventory)
+        # Offers don't reserve inventory on the server. Reserve locally for
+        # every possible acceptance, without counting any promised receipts.
+        for offer in self.outgoing(state):
+            for resource, amount in bundle_values(offer.give).items():
+                inventory[resource] -= amount
+        return inventory
 
-        if used >= maximum:
-            print(
-                "No command-result capacity remains:",
-                used,
-                "/",
-                maximum,
-            )
-            return False
+    def reserves(self, state):
+        # Protect actual upkeep even during a specialty production surge.
+        upkeep = bundle_values(state.self.upkeep_per_tick)
+        return {r: upkeep[r] * SAFETY_TICKS for r in RESOURCES}
 
-        return True
+    def needs(self, state):
+        inventory = bundle_values(state.self.inventory)
+        upkeep = bundle_values(state.self.upkeep_per_tick)
+        targets = {r: upkeep[r] * (SAFETY_TICKS if r == state.self.specialty
+                                   else TARGET_TICKS) for r in RESOURCES}
+        return sorted([r for r in RESOURCES if inventory[r] < targets[r]],
+                      key=lambda r: inventory[r] / max(1, upkeep[r]))
 
-    def command_allowed_this_tick(self, state):
-        """Check the per-tick command limit."""
+    def benefit(self, inventory, state):
+        # Improving either of two tied shortages is useful. Cap the score at
+        # the target so a large specialty surplus cannot mask starvation.
+        upkeep = bundle_values(state.self.upkeep_per_tick)
+        return sum(min(TARGET_TICKS, inventory[r] / upkeep[r])
+                   for r in RESOURCES if upkeep[r])
 
-        commands_this_tick = sum(
-            1
-            for result in state.request_results.items
-            if result.processed_tick == state.tick
-        )
-
-        limit = (
-            state.rules.new_commands_per_station_per_tick
-        )
-
-        if commands_this_tick >= limit:
-            print(
-                "Per-tick command limit reached:",
-                commands_this_tick,
-                "/",
-                limit,
-            )
-            return False
-
-        return True
-
-    async def accept_helpful_offer(
-        self,
-        websocket,
-        state,
-    ):
-        """
-        Accept gifts and trades that improve P07's minimum
-        estimated resource survival time.
-        """
-
-        inventory = bundle_values(
-            state.self.inventory
-        )
-        demands = effective_upkeep(state)
-
-        current_score = survival_score(
-            inventory,
-            demands,
-        )
-
-        best_offer = None
-        best_score = current_score
-
-        for offer in state.offers.items:
-            if (
-                offer.recipient_id != STATION_ID
-                or offer.proposer_id == STATION_ID
-                or offer.status
-                != bazaar.OFFER_STATUS_OPEN
-            ):
-                continue
-
-            received = bundle_values(offer.give)
-            payment = bundle_values(offer.receive)
-
-            # P07 must be able to pay everything requested.
-            can_afford = all(
-                inventory[resource]
-                >= payment[resource]
-                for resource in RESOURCES
-            )
-
-            if not can_afford:
-                continue
-
-            after_trade = {
-                resource: (
-                    inventory[resource]
-                    - payment[resource]
-                    + received[resource]
-                )
-                for resource in RESOURCES
-            }
-
-            total_received = sum(received.values())
-            total_payment = sum(payment.values())
-
-            # Gifts may contain between one and three
-            # total resource units.
-            is_gift = (
-                MIN_TRADE_AMOUNT
-                <= total_received
-                <= MAX_TRADE_AMOUNT
-                and total_payment == 0
-            )
-
-            # Normal trades must contain between one and
-            # three total units on each side.
-            is_small_trade = (
-                MIN_TRADE_AMOUNT
-                <= total_received
-                <= MAX_TRADE_AMOUNT
-                and MIN_TRADE_AMOUNT
-                <= total_payment
-                <= MAX_TRADE_AMOUNT
-            )
-
-            if not is_gift and not is_small_trade:
-                print(
-                    "BOT: Rejected oversized offer",
-                    offer.offer_id,
-                    f"(receive={total_received}, "
-                    f"pay={total_payment})",
-                )
-                continue
-
-            # Make sure the trade does not dangerously
-            # reduce a resource P07 already owns.
-            keeps_safe_reserve = True
-
-            for resource in RESOURCES:
-                reserve = (
-                    demands[resource]
-                    * SAFETY_TICKS
-                )
-
-                # If already below the desired reserve,
-                # the trade must not make it even worse.
-                minimum_allowed = min(
-                    inventory[resource],
-                    reserve,
-                )
-
-                if (
-                    after_trade[resource]
-                    < minimum_allowed
-                ):
-                    keeps_safe_reserve = False
-                    break
-
-            if not keeps_safe_reserve:
-                print(
-                    "BOT: Rejected unsafe offer",
-                    offer.offer_id,
-                    "because it reduces a protected resource",
-                )
-                continue
-
-            new_score = survival_score(
-                after_trade,
-                demands,
-            )
-
-            # Accept small gifts automatically.
-            # Other trades must improve survival.
-            if is_gift or new_score > best_score:
-                best_offer = offer
-                best_score = new_score
-
-        if best_offer is None:
-            return False
-
+    async def send_command(self, websocket, state, action, body):
         message = bazaar.ClientMessage()
-
-        message.accept.type = (
-            bazaar.ACCEPT_TYPE_ACCEPT
-        )
-        message.accept.protocol_version = "2.0"
-        message.accept.run_id = state.run_id
-        message.accept.request_id = (
-            self.new_request_id("accept")
-        )
-        message.accept.body.offer_id = (
-            best_offer.offer_id
-        )
-
-        if not message.IsInitialized():
-            raise ValueError(
-                message.FindInitializationErrors()
-            )
-
-        await websocket.send(
-            message.SerializeToString()
-        )
-
-        print(
-            "BOT: Accepted helpful offer",
-            best_offer.offer_id,
-        )
-
+        command = getattr(message, action)
+        command.type = {'accept': bazaar.ACCEPT_TYPE_ACCEPT,
+                        'offer': bazaar.OFFER_COMMAND_TYPE_OFFER,
+                        'advertise': bazaar.ADVERTISE_TYPE_ADVERTISE}[action]
+        command.protocol_version = '2.0'
+        command.run_id = state.run_id
+        command.request_id = self.new_request_id(action)
+        command.body.CopyFrom(body)
+        data = message.SerializeToString()
+        if len(data) > state.rules.max_command_bytes:
+            return False
+        await websocket.send(data)
+        self.pending_request = command.request_id
+        self.pending_version = None
+        self.sent_commands[command.request_id] = state.tick
         return True
 
-    def choose_resources(self, state):
-        """
-        Choose the resource P07 needs most and the safest
-        resource to use as payment.
-        """
+    def record_result(self, result):
+        if result.request_id in self.sent_commands:
+            self.sent_commands[result.request_id] = result.processed_tick
+        if result.request_id == self.pending_request:
+            self.pending_version = result.processed_version
 
-        inventory = bundle_values(
-            state.self.inventory
-        )
-        demands = effective_upkeep(state)
-
-        def remaining_ticks(resource):
-            required = demands[resource]
-
-            if required == 0:
-                return float("inf")
-
-            return (
-                inventory[resource] / required
-            )
-
-        non_specialty_resources = [
-            resource
-            for resource in RESOURCES
-            if resource != state.self.specialty
-        ]
-
-        # Prefer seeking a non-specialty resource.
-        needed_resource = min(
-            non_specialty_resources,
-            key=remaining_ticks,
-        )
-
-        possible_payments = []
-
-        for resource in RESOURCES:
-            if resource == needed_resource:
-                continue
-
-            reserve = (
-                demands[resource] * SAFETY_TICKS
-            )
-
-            # Confirm that paying one unit leaves the reserve.
-            if inventory[resource] - 1 >= reserve:
-                possible_payments.append(resource)
-
-        if not possible_payments:
-            return needed_resource, None
-
-        # Prefer paying with the station's specialty when safe.
-        if state.self.specialty in possible_payments:
-            payment_resource = state.self.specialty
-        else:
-            payment_resource = max(
-                possible_payments,
-                key=remaining_ticks,
-            )
-
-        return needed_resource, payment_resource
-
-    async def make_helpful_offer(
-        self,
-        websocket,
-        state,
-        needed_resource,
-        payment_resource,
-    ):
-        """
-        Send a one-for-one offer to a station whose
-        advertisement matches P07's needs.
-        """
-
-        if payment_resource is None:
-            return False
-
-        # Wait while P07 already has an open outgoing offer.
+    async def accept_helpful_offer(self, websocket, state):
+        inventory = self.available_inventory(state)
+        reserves = self.reserves(state)
+        best, best_gain = None, 0
         for offer in state.offers.items:
-            if (
-                offer.proposer_id == STATION_ID
-                and offer.status
-                == bazaar.OFFER_STATUS_OPEN
-            ):
-                print(
-                    "BOT: Waiting for an existing "
-                    "outgoing offer."
-                )
-                return False
-
-        ranked_advertisements = sorted(
-            state.advertisements.items,
-            key=lambda advertisement: (
-                self.specialty_evidence_score(
-                    advertisement.station_id,
-                    needed_resource,
-                )
-            ),
-            reverse=True,
-        )
-
-        for advertisement in ranked_advertisements:
-            if advertisement.station_id == STATION_ID:
+            if (offer.recipient_id != state.self_station_id
+                    or offer.proposer_id == state.self_station_id
+                    or offer.status != bazaar.OFFER_STATUS_OPEN
+                    or offer.expires_tick <= state.tick
+                    or (state.tick, offer.offer_id) in self.accept_attempts):
                 continue
-
-            if (
-                advertisement.status
-                != bazaar.PUBLICATION_STATUS_ACTIVE
-            ):
+            payment, received = bundle_values(offer.receive), bundle_values(offer.give)
+            if any(payment[r] > max(0, inventory[r]) for r in RESOURCES):
                 continue
-
-            peer_sells_needed = (
-                needed_resource
-                in advertisement.selling.items
-            )
-
-            peer_wants_payment = (
-                payment_resource
-                in advertisement.seeking.items
-            )
-
-            if not (
-                peer_sells_needed
-                and peer_wants_payment
-            ):
+            after = {r: inventory[r] - payment[r] + received[r] for r in RESOURCES}
+            if any(after[r] < min(inventory[r], reserves[r]) for r in RESOURCES):
                 continue
+            gift = sum(payment.values()) == 0 and sum(received.values()) > 0
+            gain = self.benefit(after, state) - self.benefit(inventory, state)
+            if gift or gain > best_gain:
+                best, best_gain = offer, gain
+                if gift:
+                    break
+        if best is None:
+            return False
+        sent = await self.send_command(websocket, state, 'accept',
+                                      bazaar.AcceptBody(offer_id=best.offer_id))
+        if sent:
+            self.accept_attempts.add((state.tick, best.offer_id))
+            print('BOT: Accepting helpful offer', best.offer_id)
+        return sent
 
-            trade_key = (
-                state.tick,
-                advertisement.station_id,
-                payment_resource,
-                needed_resource,
-            )
-
-            if trade_key in self.sent_offer_keys:
+    async def make_helpful_offer(self, websocket, state):
+        outgoing = self.outgoing(state)
+        if len(outgoing) >= min(4, state.rules.max_open_outgoing_offers):
+            return False
+        inventory = self.available_inventory(state)
+        reserves = self.reserves(state)
+        upkeep = bundle_values(state.self.upkeep_per_tick)
+        actual = bundle_values(state.self.inventory)
+        ttl = min(6, state.rules.max_offer_ttl_ticks)
+        if ttl < 1:
+            return False
+        for needed in self.needs(state):
+            # Permit two independent suppliers per resource. Unsettled offers
+            # never count as inventory, but bound duplicate procurement.
+            relevant = [o for o in outgoing if bundle_values(o.receive)[needed]]
+            if len(relevant) >= 2:
                 continue
-
-            self.sent_offer_keys.add(trade_key)
-
-            message = bazaar.ClientMessage()
-
-            message.offer.type = (
-                bazaar.OFFER_COMMAND_TYPE_OFFER
-            )
-            message.offer.protocol_version = "2.0"
-            message.offer.run_id = state.run_id
-            message.offer.request_id = (
-                self.new_request_id("offer")
-            )
-
-            body = message.offer.body
-            body.recipient_id = (
-                advertisement.station_id
-            )
-
-            body.give.water = 0
-            body.give.food = 0
-            body.give.components = 0
-
-            body.receive.water = 0
-            body.receive.food = 0
-            body.receive.components = 0
-
-            if payment_resource == bazaar.RESOURCE_WATER:
-                body.give.water = 1
-            elif payment_resource == bazaar.RESOURCE_FOOD:
-                body.give.food = 1
-            else:
-                body.give.components = 1
-
-            if needed_resource == bazaar.RESOURCE_WATER:
-                body.receive.water = 1
-            elif needed_resource == bazaar.RESOURCE_FOOD:
-                body.receive.food = 1
-            else:
-                body.receive.components = 1
-
-            maximum_ttl = (
-                state.rules.max_offer_ttl_ticks
-            )
-
-            if maximum_ttl < 1:
-                return False
-
-            ttl = min(3, maximum_ttl)
-            body.expires_tick = state.tick + ttl
-
-            if not message.IsInitialized():
-                raise ValueError(
-                    message.FindInitializationErrors()
-                )
-
-            await websocket.send(
-                message.SerializeToString()
-            )
-
-            print(
-                "BOT: Sent offer to",
-                advertisement.station_id,
-                "— give 1",
-                RESOURCE_NAMES[payment_resource],
-                "for 1",
-                RESOURCE_NAMES[needed_resource],
-            )
-
-            return True
-
+            ads = sorted(state.advertisements.items, key=lambda a: (
+                self.peer_attempts.get((a.station_id, needed), -1),
+                -self.specialty_evidence_score(a.station_id, needed)))
+            for ad in ads:
+                if (ad.station_id == state.self_station_id
+                        or ad.status != bazaar.PUBLICATION_STATUS_ACTIVE
+                        or ad.expires_tick <= state.tick
+                        or needed not in ad.selling.items
+                        or any(o.recipient_id == ad.station_id for o in relevant)):
+                    continue
+                key = (state.tick, ad.station_id, needed)
+                if key in self.sent_offer_keys:
+                    continue
+                payments = [r for r in RESOURCES if r != needed
+                            and inventory[r] > reserves[r]
+                            and (not ad.seeking.items or r in ad.seeking.items)]
+                if not payments:
+                    continue
+                payment = max(payments, key=lambda r: (
+                    r == state.self.specialty, inventory[r] - reserves[r]))
+                # Spend abundant specialty stock more readily near shortage.
+                urgent = actual[needed] <= 2 * upkeep[needed]
+                ratio = 2 if urgent and payment == state.self.specialty else 1
+                promised = sum(bundle_values(o.receive)[needed] for o in relevant)
+                deficit = max(0, TARGET_TICKS * upkeep[needed] - actual[needed] - promised)
+                amount = min(MAX_TRADE_AMOUNT, deficit,
+                             (inventory[payment] - reserves[payment]) // ratio)
+                if amount < 1:
+                    continue
+                body = bazaar.OfferBody(recipient_id=ad.station_id,
+                                       expires_tick=state.tick + ttl)
+                for r in RESOURCES:
+                    setattr(body.give, RESOURCE_NAMES[r], amount * ratio if r == payment else 0)
+                    setattr(body.receive, RESOURCE_NAMES[r], amount if r == needed else 0)
+                if await self.send_command(websocket, state, 'offer', body):
+                    self.sent_offer_keys.add(key)
+                    self.peer_attempts[(ad.station_id, needed)] = state.tick
+                    print(f'BOT: Offered {amount * ratio} {RESOURCE_NAMES[payment]} '
+                          f'to {ad.station_id} for {amount} {RESOURCE_NAMES[needed]}')
+                    return True
         return False
 
-    async def advertise_needs(
-        self,
-        websocket,
-        state,
-        needed_resource,
-        payment_resource,
-    ):
-        """
-        Advertise the resource P07 can safely sell and
-        the resource P07 currently needs.
-        """
-
-        if payment_resource is None:
-            print(
-                "BOT: No resource can safely be traded."
-            )
+    async def advertise_needs(self, websocket, state):
+        inventory = self.available_inventory(state)
+        reserves = self.reserves(state)
+        selling = {r for r in RESOURCES if inventory[r] > reserves[r]}
+        seeking = set(self.needs(state))
+        if not seeking:
             return False
-
-        # Do not replace an already-correct advertisement.
-        for advertisement in state.advertisements.items:
-            if (
-                advertisement.station_id
-                == STATION_ID
-                and advertisement.status
-                == bazaar.PUBLICATION_STATUS_ACTIVE
-                and set(advertisement.selling.items)
-                == {payment_resource}
-                and set(advertisement.seeking.items)
-                == {needed_resource}
-            ):
-                print(
-                    "BOT: Current advertisement already "
-                    "matches our needs."
-                )
+        for ad in state.advertisements.items:
+            if (ad.station_id == state.self_station_id
+                    and ad.status == bazaar.PUBLICATION_STATUS_ACTIVE
+                    and ad.expires_tick > state.tick + 1
+                    and set(ad.selling.items) == selling
+                    and set(ad.seeking.items) == seeking):
                 return False
-
-        maximum_ttl = (
-            state.rules.max_publication_ttl_ticks
-        )
-
-        if maximum_ttl < 1:
+        ttl = min(12, state.rules.max_publication_ttl_ticks)
+        if ttl < 1:
             return False
-
-        message = bazaar.ClientMessage()
-
-        message.advertise.type = (
-            bazaar.ADVERTISE_TYPE_ADVERTISE
-        )
-        message.advertise.protocol_version = "2.0"
-        message.advertise.run_id = state.run_id
-        message.advertise.request_id = (
-            self.new_request_id("advertise")
-        )
-
-        message.advertise.body.selling.items.append(
-            payment_resource
-        )
-        message.advertise.body.seeking.items.append(
-            needed_resource
-        )
-
-        ttl = min(6, maximum_ttl)
-
-        message.advertise.body.expires_tick = (
-            state.tick + ttl
-        )
-
-        if not message.IsInitialized():
-            raise ValueError(
-                message.FindInitializationErrors()
-            )
-
-        await websocket.send(
-            message.SerializeToString()
-        )
-
-        print(
-            "BOT: Advertised selling",
-            RESOURCE_NAMES[payment_resource],
-            "and seeking",
-            RESOURCE_NAMES[needed_resource],
-        )
-
-        return True
+        body = bazaar.AdvertiseBody(expires_tick=state.tick + ttl)
+        body.selling.items.extend(sorted(selling))
+        body.seeking.items.extend(sorted(seeking))
+        body.selling.SetInParent()
+        body.seeking.SetInParent()
+        sent = await self.send_command(websocket, state, 'advertise', body)
+        if sent:
+            print('BOT: Advertised needs:', ', '.join(RESOURCE_NAMES[r] for r in sorted(seeking)))
+        return sent
 
     async def act(self, websocket, state):
-        """Take at most one useful action for this state."""
-
-        market_changed = self.observe_market(state)
-
-        if market_changed:
+        if self.observe_market(state):
             self.print_market_estimates(state)
-
-        if state.phase != bazaar.PHASE_RUNNING:
-            print(
-                "BOT: Run is not currently running."
-            )
+        for result in state.request_results.items:
+            self.record_result(result)
+        if self.pending_request is not None:
+            if self.pending_version is None or state.world_version < self.pending_version:
+                return
+            self.pending_request = None
+            self.pending_version = None
+        if state.phase != bazaar.PHASE_RUNNING or state.self.failed_once:
             return
-
-        if state.self.failed_once:
-            print(
-                "BOT: P07 has failed and cannot recover."
-            )
+        self.sent_offer_keys = {k for k in self.sent_offer_keys if k[0] == state.tick}
+        self.accept_attempts = {k for k in self.accept_attempts if k[0] == state.tick}
+        # Count local sends too: queued snapshots may omit command results.
+        records = {r.request_id: r.processed_tick for r in state.request_results.items}
+        records.update(self.sent_commands)
+        if len(records) >= state.rules.max_request_records_per_station:
             return
-
-        if not self.command_space_available(state):
+        if sum(t == state.tick for t in records.values()) >= state.rules.new_commands_per_station_per_tick:
             return
-
-        if not self.command_allowed_this_tick(state):
+        if await self.accept_helpful_offer(websocket, state):
             return
-
-        # Priority 1: accept gifts or survival-improving offers.
-        acted = await self.accept_helpful_offer(
-            websocket,
-            state,
-        )
-
-        if acted:
+        if await self.make_helpful_offer(websocket, state):
             return
-
-        needed_resource, payment_resource = (
-            self.choose_resources(state)
-        )
-
-        print(
-            "BOT: Most needed resource:",
-            RESOURCE_NAMES[needed_resource],
-        )
-
-        if payment_resource is not None:
-            print(
-                "BOT: Safest payment resource:",
-                RESOURCE_NAMES[payment_resource],
-            )
-
-        # Priority 2: send an offer matching another
-        # station's advertisement.
-        acted = await self.make_helpful_offer(
-            websocket,
-            state,
-            needed_resource,
-            payment_resource,
-        )
-
-        if acted:
-            return
-
-        # Priority 3: advertise P07's current needs.
-        await self.advertise_needs(
-            websocket,
-            state,
-            needed_resource,
-            payment_resource,
-        )
+        await self.advertise_needs(websocket, state)
 
 
 # --------------------------------------------------
@@ -1073,7 +720,7 @@ async def main():
     if not token:
         raise ValueError(
             "BAZAAR_TOKEN is missing.\n"
-            "Run: export BAZAAR_TOKEN='your P07 token'"
+            f"Run: export BAZAAR_TOKEN='your {STATION_ID} token'"
         )
 
     bot = SurvivalBot()
@@ -1173,7 +820,7 @@ async def main():
 
             if not response.readiness.ready:
                 raise RuntimeError(
-                    "The server did not mark P07 ready"
+                    f"The server did not mark {STATION_ID} ready"
                 )
 
         elif response_type == "protocol_error":
@@ -1190,7 +837,7 @@ async def main():
                 f"received {response_type}"
             )
 
-        print("P07 is connected and ready.")
+        print(f"{STATION_ID} is connected and ready.")
         print("The survival bot is active.")
         print("Press Control+C to disconnect.\n")
 
@@ -1229,18 +876,22 @@ async def main():
 
             elif update_type == "result":
                 print_result(update.result)
+                bot.record_result(update.result)
+                # Request a fresh authoritative state even after a rejection.
+                sync = bazaar.ClientMessage()
+                sync.sync.type = bazaar.SYNC_TYPE_SYNC
+                sync.sync.protocol_version = "2.0"
+                sync.sync.run_id = run_id
+                await websocket.send(sync.SerializeToString())
 
             elif update_type == "protocol_error":
                 print_protocol_error(
                     update.protocol_error
                 )
 
-                if update.protocol_error.close_session:
-                    print(
-                        "The server requested that "
-                        "the session close."
-                    )
-                    break
+                # Stop issuing commands after a control error; preserve the
+                # server message instead of blindly resubmitting.
+                raise RuntimeError("Server rejected a command; see protocol error above")
 
             elif update_type == "readiness":
                 print(
@@ -1255,14 +906,22 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print(
-            "\nDisconnected from the Bazaar server."
-        )
-    except websockets.ConnectionClosed as error:
-        print(
-            "\nWebSocket connection closed:",
-            error,
-        )
+    log_directory = Path(__file__).resolve().parent / "logs"
+    log_directory.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    log_path = log_directory / f"live_client_{timestamp}.log"
+
+    with log_path.open("x", encoding="utf-8") as log_file:
+        with redirect_stdout(TeeOutput(sys.stdout, log_file)), \
+                redirect_stderr(TeeOutput(sys.stderr, log_file)):
+            print("Logging to:", log_path)
+            try:
+                asyncio.run(main())
+            except KeyboardInterrupt:
+                print("\nDisconnected from the Bazaar server.")
+            except websockets.ConnectionClosed as error:
+                print("\nWebSocket connection closed:", error)
+            except Exception:
+                # Print before restoring stderr so the log includes the traceback.
+                traceback.print_exc()
+                sys.exit(1)
