@@ -22,6 +22,7 @@ STATION_ID = "P07"
 # Keep enough resources for approximately this many future ticks.
 SAFETY_TICKS = 3
 TARGET_TICKS = 16
+ABUNDANCE_TICKS = 20
 MAX_TRADE_AMOUNT = 12
 GENEROUS_PRICE_TICKS = 8
 ABUNDANT_SPECIALTY_TICKS = 24
@@ -546,6 +547,21 @@ class SurvivalBot:
         return sum(min(TARGET_TICKS, inventory[r] / upkeep[r])
                    for r in RESOURCES if upkeep[r])
 
+    def offerable_inventory(self, state):
+        """Only spend uncommitted surplus of resources we aren't seeking."""
+        inventory = self.available_inventory(state)
+        upkeep = bundle_values(state.self.upkeep_per_tick)
+        seeking = set(self.needs(state))
+        return {
+            r: 0 if r in seeking else max(
+                0, inventory[r] - (
+                    GIFT_KEEP_TICKS if r == state.self.specialty
+                    else ABUNDANCE_TICKS
+                ) * max(1, upkeep[r])
+            )
+            for r in RESOURCES
+        }
+
     async def send_command(self, websocket, state, action, body):
         message = bazaar.ClientMessage()
         command = getattr(message, action)
@@ -573,6 +589,7 @@ class SurvivalBot:
 
     async def accept_helpful_offer(self, websocket, state):
         inventory = self.available_inventory(state)
+        offerable = self.offerable_inventory(state)
         reserves = self.reserves(state)
         upkeep = bundle_values(state.self.upkeep_per_tick)
         best, best_priority = None, None
@@ -584,6 +601,8 @@ class SurvivalBot:
                     or (state.tick, offer.offer_id) in self.accept_attempts):
                 continue
             payment, received = bundle_values(offer.receive), bundle_values(offer.give)
+            if any(payment[r] > offerable[r] for r in RESOURCES):
+                continue
             if any(payment[r] > max(0, inventory[r]) for r in RESOURCES):
                 continue
             after = {r: inventory[r] - payment[r] + received[r] for r in RESOURCES}
@@ -617,6 +636,7 @@ class SurvivalBot:
         if len(outgoing) >= min(4, state.rules.max_open_outgoing_offers):
             return False
         inventory = self.available_inventory(state)
+        offerable = self.offerable_inventory(state)
         reserves = self.reserves(state)
         upkeep = bundle_values(state.self.upkeep_per_tick)
         actual = bundle_values(state.self.inventory)
@@ -643,7 +663,7 @@ class SurvivalBot:
                 if key in self.sent_offer_keys:
                     continue
                 payments = [r for r in RESOURCES if r != needed
-                            and inventory[r] > reserves[r]
+                            and offerable[r] > 0
                             and (not ad.seeking.items or r in ad.seeking.items)]
                 if not payments:
                     continue
@@ -660,7 +680,7 @@ class SurvivalBot:
                 promised = sum(bundle_values(o.receive)[needed] for o in relevant)
                 deficit = max(0, TARGET_TICKS * upkeep[needed] - actual[needed] - promised)
                 amount = min(MAX_TRADE_AMOUNT, deficit,
-                             (inventory[payment] - reserves[payment]) // ratio)
+                             offerable[payment] // ratio)
                 if amount < 1:
                     continue
                 body = bazaar.OfferBody(recipient_id=ad.station_id,
@@ -694,10 +714,8 @@ class SurvivalBot:
         reserves = self.reserves(state)
         if any(inventory[r] < reserves[r] for r in RESOURCES if r != specialty):
             return False
-        tick_supply = max(1, upkeep[specialty])
-        # Gift all uncommitted specialty stock above the upkeep reserve.
-        amount = inventory[specialty] - max(reserves[specialty],
-                                          GIFT_KEEP_TICKS * tick_supply)
+        # Gifts obey the same surplus and seeking rules as paid trades.
+        amount = self.offerable_inventory(state)[specialty]
         ttl = min(6, state.rules.max_offer_ttl_ticks)
         if amount < 1 or ttl < 1:
             return False
@@ -744,9 +762,8 @@ class SurvivalBot:
         return True
 
     async def advertise_needs(self, websocket, state):
-        inventory = self.available_inventory(state)
-        reserves = self.reserves(state)
-        selling = {r for r in RESOURCES if inventory[r] > reserves[r]}
+        offerable = self.offerable_inventory(state)
+        selling = {r for r in RESOURCES if offerable[r] > 0}
         seeking = set(self.needs(state))
         if not seeking:
             return False
