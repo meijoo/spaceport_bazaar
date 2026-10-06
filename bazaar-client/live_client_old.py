@@ -21,12 +21,8 @@ STATION_ID = "P07"
 
 # Keep enough resources for approximately this many future ticks.
 SAFETY_TICKS = 3
-TARGET_TICKS = 16
-MAX_TRADE_AMOUNT = 12
-GENEROUS_PRICE_TICKS = 8
-ABUNDANT_SPECIALTY_TICKS = 24
-GIFT_INTERVAL_TICKS = 5
-GIFT_KEEP_TICKS = 16
+TARGET_TICKS = 8
+MAX_TRADE_AMOUNT = 6
 
 RESOURCE_NAMES = {
     bazaar.RESOURCE_WATER: "water",
@@ -272,9 +268,6 @@ class SurvivalBot:
         self.sent_commands = {}
         self.pending_request = None
         self.pending_version = None
-        self.last_gift_tick = None
-        self.gift_peer_attempts = {}
-        self.gift_queue = []
 
         # Evidence that each station specializes in each resource.
         self.market_evidence = defaultdict(
@@ -574,8 +567,7 @@ class SurvivalBot:
     async def accept_helpful_offer(self, websocket, state):
         inventory = self.available_inventory(state)
         reserves = self.reserves(state)
-        upkeep = bundle_values(state.self.upkeep_per_tick)
-        best, best_priority = None, None
+        best, best_gain = None, 0
         for offer in state.offers.items:
             if (offer.recipient_id != state.self_station_id
                     or offer.proposer_id == state.self_station_id
@@ -591,18 +583,10 @@ class SurvivalBot:
                 continue
             gift = sum(payment.values()) == 0 and sum(received.values()) > 0
             gain = self.benefit(after, state) - self.benefit(inventory, state)
-            if not gift and gain <= 0:
-                continue
-            # First cover resources that cannot fund the next upkeep tick.
-            # Among equally urgent trades, take the earliest expiration,
-            # then the largest improvement to reserves.
-            shortages_covered = sum(
-                inventory[r] < upkeep[r] <= after[r]
-                for r in RESOURCES if upkeep[r]
-            )
-            priority = (shortages_covered, -offer.expires_tick, gain)
-            if best_priority is None or priority > best_priority:
-                best, best_priority = offer, priority
+            if gift or gain > best_gain:
+                best, best_gain = offer, gain
+                if gift:
+                    break
         if best is None:
             return False
         sent = await self.send_command(websocket, state, 'accept',
@@ -649,14 +633,9 @@ class SurvivalBot:
                     continue
                 payment = max(payments, key=lambda r: (
                     r == state.self.specialty, inventory[r] - reserves[r]))
-                # Pay more before an emergency when uncommitted specialty
-                # stock is abundant; retain the emergency premium as well.
+                # Spend abundant specialty stock more readily near shortage.
                 urgent = actual[needed] <= 2 * upkeep[needed]
-                abundant = inventory[payment] > (
-                    ABUNDANT_SPECIALTY_TICKS * max(1, upkeep[payment]))
-                replenish_early = actual[needed] <= GENEROUS_PRICE_TICKS * upkeep[needed]
-                ratio = (2 if payment == state.self.specialty
-                         and (urgent or (abundant and replenish_early)) else 1)
+                ratio = 2 if urgent and payment == state.self.specialty else 1
                 promised = sum(bundle_values(o.receive)[needed] for o in relevant)
                 deficit = max(0, TARGET_TICKS * upkeep[needed] - actual[needed] - promised)
                 amount = min(MAX_TRADE_AMOUNT, deficit,
@@ -675,73 +654,6 @@ class SurvivalBot:
                           f'to {ad.station_id} for {amount} {RESOURCE_NAMES[needed]}')
                     return True
         return False
-
-    async def make_specialty_gift(self, websocket, state):
-        if (not self.gift_queue and self.last_gift_tick is not None
-                and state.tick - self.last_gift_tick < GIFT_INTERVAL_TICKS):
-            return False
-        outgoing = self.outgoing(state)
-        if len(outgoing) >= min(4, state.rules.max_open_outgoing_offers):
-            return False
-        # Finish distributing a round before starting another gift round.
-        if not self.gift_queue and any(sum(bundle_values(o.receive).values()) == 0 for o in outgoing):
-            return False
-        inventory = self.available_inventory(state)
-        upkeep = bundle_values(state.self.upkeep_per_tick)
-        specialty = state.self.specialty
-        if specialty not in RESOURCES:
-            return False
-        reserves = self.reserves(state)
-        if any(inventory[r] < reserves[r] for r in RESOURCES if r != specialty):
-            return False
-        tick_supply = max(1, upkeep[specialty])
-        # Gift all uncommitted specialty stock above the upkeep reserve.
-        amount = inventory[specialty] - max(reserves[specialty],
-                                          GIFT_KEEP_TICKS * tick_supply)
-        ttl = min(6, state.rules.max_offer_ttl_ticks)
-        if amount < 1 or ttl < 1:
-            return False
-        seeking = {a.station_id for a in state.advertisements.items
-                   if a.status == bazaar.PUBLICATION_STATUS_ACTIVE
-                   and a.expires_tick > state.tick
-                   and specialty in a.seeking.items}
-        peers = {p.station_id for p in state.directory.items}
-        peers.update(a.station_id for a in state.advertisements.items
-                     if a.status == bazaar.PUBLICATION_STATUS_ACTIVE
-                     and a.expires_tick > state.tick)
-        peers.discard(state.self_station_id)
-        peers.difference_update(o.recipient_id for o in outgoing)
-        if not peers:
-            return False
-        peers = {p for p in peers if self.specialty_estimate(p)[0] != specialty}
-        if not peers:
-            self.gift_queue.clear()
-            return False
-        if not self.gift_queue:
-            recipients = sorted(peers, key=lambda p: (
-                p not in seeking, self.gift_peer_attempts.get(p, -1), p))
-            share, remainder = divmod(amount, len(recipients))
-            self.gift_queue = [(p, share + (i < remainder))
-                               for i, p in enumerate(recipients)
-                               if share + (i < remainder) > 0]
-        # A round keeps fixed shares while offers settle. Recheck current
-        # eligibility and surplus so intervening trades cannot spend reserves.
-        self.gift_queue = [(p, n) for p, n in self.gift_queue if p in peers]
-        if not self.gift_queue:
-            return False
-        peer, share = self.gift_queue[0]
-        amount = min(amount, share)
-        body = bazaar.OfferBody(recipient_id=peer, expires_tick=state.tick + ttl)
-        for r in RESOURCES:
-            setattr(body.give, RESOURCE_NAMES[r], amount if r == specialty else 0)
-            setattr(body.receive, RESOURCE_NAMES[r], 0)
-        if not await self.send_command(websocket, state, 'offer', body):
-            return False
-        self.last_gift_tick = state.tick
-        self.gift_queue.pop(0)
-        self.gift_peer_attempts[peer] = state.tick
-        print(f'BOT: Offered gift of {amount} {RESOURCE_NAMES[specialty]} to {peer}')
-        return True
 
     async def advertise_needs(self, websocket, state):
         inventory = self.available_inventory(state)
@@ -794,8 +706,6 @@ class SurvivalBot:
         if await self.accept_helpful_offer(websocket, state):
             return
         if await self.make_helpful_offer(websocket, state):
-            return
-        if await self.make_specialty_gift(websocket, state):
             return
         await self.advertise_needs(websocket, state)
 
